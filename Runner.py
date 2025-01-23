@@ -1,13 +1,13 @@
 ## RUN THE COMPUTATION OF MIN GENS AND DEATH POINTS
 import os
-from ComputeMinGensDP import computeMinGensAndDeathPoints
+from src.ComputeMinGensDP import computeMinGensAndDeathPoints
 
 
 data_folder = os.path.join(os.getcwd(), 'data')
 output_folder = os.path.join(os.getcwd(), 'results')
 picture_folder = os.path.join(os.getcwd(), 'results')
 
-Thresh = 3.7
+Thresh = .2
 plot = True
 deathpoints=True
 verbose=True

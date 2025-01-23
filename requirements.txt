@@ -1,0 +1,8 @@
+Cython==0.29.32
+CyUtils==0.0.10
+gudhi==3.10.1
+matplotlib==3.6.0
+networkx==2.8.7
+numpy==1.23.3
+pandas==1.5.0
+scipy==1.9.1
