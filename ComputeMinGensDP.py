@@ -2,6 +2,7 @@
 # This script defines a function to compute minimal generators for H_1 of an Alpha filtration
 # plus the death point of the persistent homology classes they belong to
 
+import os
 import numpy as np
 import scipy as sp
 import scipy.sparse
@@ -141,12 +142,17 @@ def computeMinGensAndDeathPoints(Thresh, data_folder, output_folder, plot=False,
                 print('Duration - ' + str(end-start), flush=True)
 
             # Adjust output
+         
             cycles = cycles.as_list()
             cycles = [ x[0].tolist() for x in cycles ]
             eL = np.array(eL)
             
             if verbose:
-                print('The shape of cycles is ',str(len(cycles[0])) , " x ",str(len(cycles)))
+                if len(cycles) != 0:
+                    print('The shape of cycles is ',str(len(cycles[0])) , " x ",str(len(cycles)))
+                else:
+                    print('Cycles is empty')
+                    
                 print('Shape of eL ', eL.shape)
 
                 if isItShort:
@@ -188,6 +194,12 @@ def computeMinGensAndDeathPoints(Thresh, data_folder, output_folder, plot=False,
                 ## PERSISTENCE PAIRS 
                 if verbose:
                     print('Computing death point of basis cycles', flush=True)
+                    
+                if len(cycles) == 0:
+                    
+                    if verbose:
+                        print('No cycles to compute', flush=True)
+                    return
 
 
                 PersIntervals = np.zeros((len(cycles), 2))
