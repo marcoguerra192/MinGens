@@ -26,90 +26,11 @@ import ScaffoldN
 # import the cythonized low function from CyUtils 
 from CyUtils import low as low
 
-## define stuff
-
-# def getEL(A):
-#     edgesList = []
-#     for i in range(len(A)):
-#         for j in range(i,len(A)):
-#             if A[i,j] > 0:
-#                 edgesList.append([i,j])
-#     return edgesList
-
 from scipy.spatial import Delaunay
 import scipy as sp
 
-# def AlphaComplex(points, thresh, short):
-#     ''' Takes a point cloud (Npoints x Ndims) and returns the Alpha complex at threshold thresh '''
-    
-#     NPoints = points.shape[0]
-    
-#     #build the circumsphere
-#     def circumsphereRad(P):
-#         '''
-#         TAKEN FROM YOHAI REHANI
-#         :param P: array Nxd of N points of dimension d
-#         :return: center and squared radius of the circum-sphere of P
-#         '''
-#         p1 = P[0, :]
-#         A = P[1:, :] - p1
-#         Pnorm = np.sum(np.power(P, 2), 1)
-#         b = 0.5*(Pnorm[1:] - Pnorm[0])
-#         invA = np.linalg.pinv(A)
-#         c0 = invA.dot(b)
-#         F = sp.linalg.null_space(A)
-#         if F.size != 0:
-#             z = np.transpose(F).dot(p1-c0)
-#             c = c0 + F.dot(z)
-#         else:
-#             c = c0
-#         R = np.sum(np.power(p1-c, 2))
-#         return R
 
-#     Del = Delaunay(points)
-#     #triangles = points[Del.simplices]
-    
-#     TriList = [ t for t in Del.simplices if circumsphereRad(points[t]) <= thresh**2 ]
-#     TriList = [ np.array(sorted(t)) for t in TriList ]
-    
-#     # THIS IS THE FULL ALPHA COMPLEX
-#     EdgeList = []
-#     CandidateEdges = []
-    
-#     for t in Del.simplices:
-            
-#         e1 = tuple(sorted((t[0] ,t[1])))
-#         e2 = tuple(sorted((t[0] ,t[2])))
-#         e3 = tuple(sorted((t[1] ,t[2])))  
-        
-#         CandidateEdges.extend( [e1,e2,e3] )
-    
-#     CandidateEdges = list(set(CandidateEdges))
-    
-#     for e in CandidateEdges:
-        
-#         if circumsphereRad(points[[e[0],e[1]],:]) <= thresh**2 :
-            
-#             EdgeList.append(  (e[0],e[1]) )
-            
-#     EdgeList = [ np.array(e) for e in EdgeList ]
-    
-#     # THIS GIVES THE SHORT ALPHA COMPLEX
-#     TriEdges = []
-    
-#     for t in TriList:
-#         TriEdges.append( (t[0] ,t[1]) )
-#         TriEdges.append( (t[0] ,t[2]) )
-#         TriEdges.append( (t[1] ,t[2]) )
-        
-#     TriEdges = list(set(TriEdges))
-#     TriEdges = [ np.array(e) for e in TriEdges ]
-        
-#     if not short:
-#         return TriList, EdgeList  # This gives the true Alpha complex
-#     else:
-#         return TriList, TriEdges  # This gives the short Alpha complex
-    
+
 import itertools
 
 def draw_2d_simplicial_complex(simplices, pos=None, return_pos=False, fig = None, markedEdges=None):
@@ -246,33 +167,24 @@ def circumsphereRad(P):
         
 ### COMPUTE STUFF
 
-data_folder = os.path.join(os.getcwd(), 'data', 'compScans')
-subsamples_folder = os.path.join(os.getcwd(), 'saved', 'scans', 'Alpha', '1800', 'Subsamples')
-output_folder = os.path.join(os.getcwd(), 'saved', 'scans', 'Alpha', '1800', 'Scaffolds')
-picture_folder = os.path.join(os.getcwd(), 'saved', 'scans', 'Alpha', '1800', 'Pictures')
+data_folder = os.path.join(os.getcwd(), 'data')
+output_folder = os.path.join(os.getcwd(), 'results')
+picture_folder = os.path.join(os.getcwd(), 'results')
 
-# data_folder = os.path.join(os.getcwd(), 'data', 'SmallTest')
-# subsamples_folder = os.path.join(os.getcwd(), 'saved', 'SmallTest', 'Subsamples')
-# output_folder = os.path.join(os.getcwd(), 'saved', 'SmallTest', 'Scaffolds')
-# picture_folder = os.path.join(os.getcwd(), 'saved', 'SmallTest', 'Pictures')
-
-# subsamples_folder = os.path.join(os.getcwd(), 'saved', 'scans','Short','Test1800', 'Subsamples')
-# output_folder = os.path.join(os.getcwd(), 'saved', 'scans','Short','Test1800', 'Scaffolds')
-# picture_folder = os.path.join(os.getcwd(), 'saved', 'scans','Short','Test1800', 'Pictures')
 
 # Create the output folder if it doesn't exist
-os.makedirs(output_folder, exist_ok=True)
-os.makedirs(subsamples_folder, exist_ok=True)
-os.makedirs(picture_folder, exist_ok=True)
+# os.makedirs(output_folder, exist_ok=True)
+# os.makedirs(subsamples_folder, exist_ok=True)
+# os.makedirs(picture_folder, exist_ok=True)
 
-# Process each file in the "Subsamples" folder
-for filename in os.listdir(subsamples_folder):
-    # if filename.endswith('.csv') and filename.startswith('0101'):
+# Process each file in the data folder
+for filename in os.listdir(data_folder):
+    
     if filename.endswith('.csv'):
         
         print('Processing: ',filename)
         
-        file_path = os.path.join(subsamples_folder, filename)        
+        file_path = os.path.join(data_folder, filename)        
         name, _ = os.path.splitext(filename)
         
         print('File = '+name, flush=True)
@@ -286,38 +198,16 @@ for filename in os.listdir(subsamples_folder):
         Points = pd.read_csv(file_path)
         Points = Points.to_numpy()[:,1:3] # Turn to numpy
 
-        # print('Subsample', flush=True)
-        # #Sample
-        # NPoints = 1800
-        # sample = np.random.randint(Points.shape[0], size=NPoints)
-        # sample = np.unique(sample)
-
-        # It was already subsampled
         DataSample = Points.copy()
         
         print('Number of points: '+ str(DataSample.shape), flush=True)
-
-        # # Save subsampled point cloud
-        # pd.DataFrame(DataSample).to_csv(os.path.join(subsamples_folder, name + '-1800.csv'))
-        # # save indices of subsampling 
-        # np.save(os.path.join(subsamples_folder, name + '-Indices'),sample)
-
 
         print('Build complex', flush=True)
         # Process
         
         
-#         # THIS IS WRONG!! CORRECT TO CONSIDER ONLY EDGES IN THE DELAUNAY COMPLEX
-        D = scipy.spatial.distance_matrix(DataSample, DataSample, p=2)
-        
-#         # THIS IS WRONG!! CORRECT TO CONSIDER ONLY EDGES IN THE DELAUNAY COMPLEX
-#         D = np.zeros(D.shape)
-#         for i in range(DataSample.shape[0]):
-#             for j in range(DataSample.shape[0]):
-                
-#                 dist = np.sqrt(circumsphereRad(DataSample[[i,j]]))
-#                 D[i,j] = dist
-#                 D[j,i] = dist
+
+        #D = scipy.spatial.distance_matrix(DataSample, DataSample, p=2)
         
         Thresh = 3.7
         #Thresh = 0.3
@@ -341,11 +231,6 @@ for filename in os.listdir(subsamples_folder):
         EL = [x.tolist() for x in EL]
 
         simplices = EL + TriList
-        # ShortSimplices = TriEdges + TriList
-        # if isItShort:
-        #     simplices = ShortSimplices
-        # else:
-        #     simplices = AlphaSimplices
 
 
         epsList = [Thresh]
@@ -364,17 +249,10 @@ for filename in os.listdir(subsamples_folder):
         ## IF YOU COMPUTE THE GENS
         Filtr, cycles, eL = DriverN.getFiltrBasisN(DataSample, epsList, method='Alpha', shortEdges = isItShort)
         
-        # IF YOU READ THE MIN GENS
-        # cycles = np.load(os.path.join( output_folder, name + '.npy' ))
-        # eL = np.load(os.path.join( output_folder, name + 'EdgeList.npy' ))
 
         end = datetime.datetime.now()
 
         print('Duration - ' + str(end-start), flush=True)
-
-        ## IF YOU READ THE MIN GENS
-        ##cycles = cycles.tolist()
-        #cycles = [ cycles[:,i].tolist() for i in range(cycles.shape[1]) ]
         
         # IF YOU COMPUTE THE MIN GENS
         cycles = cycles.as_list()
