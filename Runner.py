@@ -1,5 +1,5 @@
 ## RUN THE COMPUTATION OF MIN GENS AND DEATH POINTS
-
+import os
 from ComputeMinGensDP import computeMinGensAndDeathPoints
 
 
