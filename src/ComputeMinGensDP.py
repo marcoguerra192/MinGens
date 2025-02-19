@@ -11,13 +11,13 @@ import pandas as pd
 import scipy.spatial
 import datetime
 
-from src.plotting import draw_2d_simplicial_complex
+from plotting import draw_2d_simplicial_complex
 
-import src.DriverN as DriverN
-from src.acomplex import AlphaComplex
+import DriverN as DriverN
+from acomplex import AlphaComplex
 
 # import the cythonized low function from CyUtils 
-from src.CyUtils import low as low
+from CyUtils import low as low
     
         
 ### DEFINE

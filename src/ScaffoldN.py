@@ -3,7 +3,7 @@ the filtration of minimal homology bases, and plot/perform analysis.
 """
 
 import numpy as np
-import src.GeometryN as GeometryN
+import GeometryN as GeometryN
 import networkx as nx
 
 def frequency_Scaffold( Filtr , NV  ):

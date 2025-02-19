@@ -10,7 +10,7 @@ from math import floor, ceil
 import scipy.sparse
 from scipy.sparse import csgraph
 import functools
-import src.GeometryN as GeometryN
+import GeometryN as GeometryN
 import multiprocessing as mlt
 from multiprocessing import Pipe
 import os

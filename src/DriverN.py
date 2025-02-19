@@ -10,17 +10,19 @@ from random import random
 
 import pyximport
 pyximport.install()
-import src.CySPT as CySPT
-from src.CySPT import SimplexGraph
+import CySPT as CySPT
+from CySPT import SimplexGraph
 import scipy.sparse
 import time
 import datetime
 import multiprocessing
 from multiprocessing import Pool, Pipe
 import _pickle as cPickle
-import src.GeometryN as GeometryN
+import GeometryN as GeometryN
 from sys import stdout, stderr
 import os
+
+from acomplex import AlphaComplex
 
 
 def getTriangles(A):
@@ -421,8 +423,6 @@ def compute_cycles(GlobalOptions, epsList):
 #         return TriList, EdgeList  # This gives the true Alpha complex
 #     else:
 #         return TriList, TriEdges  # This gives the short Alpha complex
-
-from src.acomplex import AlphaComplex
     
 def compute_cyclesN(GlobalOptions, epsList):
 
