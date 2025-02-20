@@ -11,7 +11,7 @@ import pandas as pd
 import scipy.spatial
 import datetime
 
-from plotting import draw_2d_simplicial_complex
+from Plotting import draw_2d_simplicial_complex
 
 import DriverN as DriverN
 from acomplex import AlphaComplex
