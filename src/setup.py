@@ -8,5 +8,8 @@ except ImportError:
 from Cython.Build import cythonize
 import numpy
 
-setup(ext_modules=cythonize('CySPT.pyx') , compiler_directives={"language_level": "3"})
-setup(ext_modules=cythonize('CyUtils.pyx'), compiler_directives={"language_level": "3"}, include_dirs=[numpy.get_include()])
+extensionsSPT = [Extension("CySPT", ["CySPT.pyx"])]
+extensionsUtils = [Extension("CyUtils", ["CyUtils.pyx"])]
+
+setup(ext_modules=cythonize(extensionsSPT) , compiler_directives={"language_level": "3"})
+setup(ext_modules=cythonize(extensionsUtils), compiler_directives={"language_level": "3"}, include_dirs=[numpy.get_include()])
