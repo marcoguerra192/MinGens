@@ -3,6 +3,24 @@
 
 # -*- coding: utf-8 -*-
 # TESI: CLASSE per il problema SHORTEST PATH TREE
+#
+# FAST VERSION (2026-11). Same algorithm and same output as the original
+# CySPT.pyx (kept as Old_CySPT.pyx). Changes, all implementation-level:
+#   1. Edge lookup by dictionary instead of list.index (getHeatMap,
+#      closeCycle): O(1) per edge instead of O(#edges).
+#   2. closeCycle builds the cycle from the list of its edge indices in one
+#      step, instead of summing one dense heat map per edge.
+#   3. The Z2 label of each sentinel edge with respect to a support vector,
+#      <Sup, ann(e)> mod 2, is computed once for all sentinel edges with one
+#      matrix product, instead of once per use with a NumPy dot product.
+#   4. computeLabels uses a deque for its breadth-first traversal and works
+#      on a Python list per root, instead of popping from the front of a
+#      list and writing NumPy scalars one by one.
+#   5. The orthogonality test of findShortestNonOrtho is evaluated for all
+#      (root, non-tree edge) candidates at once with NumPy, in the same
+#      order as before, so the chosen cycle is the same.
+# fixNTE is deliberately unchanged: it fixes the order of the candidates,
+# and that order decides ties between equally short cycles.
 
 import numpy as np
 from sympy import Matrix
@@ -13,7 +31,12 @@ import functools
 import GeometryN as GeometryN
 import multiprocessing as mlt
 from multiprocessing import Pipe
+from collections import deque
 import os
+
+# Marker to check which implementation is loaded (the compiled module is
+# used in preference to the .pyx, so a rebuild is needed after editing)
+CYSPT_IMPLEMENTATION = 'fast-v2'
 
 
 class SimplexGraph:
@@ -33,6 +56,7 @@ class SimplexGraph:
         self.pred = None
         self.Followers = []
         self.Sentinel = None
+        self.SentinelSet = None
         self.CCC = None
         self.CCV = None
         self.Origins = None
@@ -58,6 +82,22 @@ class SimplexGraph:
         self.C = None  # matrice m(S_i, C_j)
         self.B = None  # matrice m(S_i, C_j)
         self.S = None  # matrice S_i
+
+        # Structures of the fast version, filled in later:
+        # AnnMat (dimH1 x #sentinel) annotation matrix as a plain int array,
+        # SentinelIdx: sentinel edge (v1, v2) -> its column in AnnMat,
+        # NTE_root, NTE_u, NTE_v, NTE_sent: the candidates as parallel arrays.
+        self.AnnMat = None
+        self.SentinelIdx = None
+        self.NTE_root = None
+        self.NTE_u = None
+        self.NTE_v = None
+        self.NTE_sent = None
+        # Cache of fixNTE: the list of all directed edges (as returned by
+        # scipy.sparse.find) and, per connected component, the set of those
+        # edges whose first vertex lies in the component.
+        self._edgeW = None
+        self._compEdgeSet = None
 
         # diversifichiamo il caso in cui abbiamo la filtrazione dal caso
         # singolo step
@@ -91,6 +131,12 @@ class SimplexGraph:
             self.WEdges = maximal[1]
             self.NonZ = int(self.Weights.count_nonzero() / 2)
 
+        # We index the edges once: (v1, v2) with v1 < v2, as Python ints,
+        # maps to the position of the edge in self.Edges.
+        self.EdgeIndex = {}
+        for k, e in enumerate(self.Edges):
+            self.EdgeIndex[(int(e[0]), int(e[1]))] = k
+
     def getEdgeList(Weights):
         """ Metodo Statico per ottenere l'edgelist da una matrice massimale
             In input solo la matrice dei pesi
@@ -116,27 +162,29 @@ class SimplexGraph:
     def getEdgeVector(self):  # ordinamento degli archi
         return self.Edges
 
+    def edgeIndex(self, e):
+        """ Position of edge e = (a, b) in self.Edges, in either orientation.
+            Raises ValueError if the edge does not exist (as getHeatMap did).
+        """
+        a = int(e[0])
+        b = int(e[1])
+        if a > b:
+            a, b = b, a
+        try:
+            return self.EdgeIndex[(a, b)]
+        except KeyError:
+            print('Wrong Edge!', e)
+            errstr = "L'edge ", e, " non esiste!"
+            raise ValueError(errstr)
+
     def getHeatMap(self, edgeList):
         """ Prende in input una lista di coppie di vertici (v1, v2), li ordina in modo che v1 < v2, e restituisce un vettore 0-1 lungo             quanto la dimensione dello spazio vettoriale delle 1-catene, che descrive la 1-catena corrispondente.
             Se l'input contiene un edge inesistente o un self-loop, solleva ValueError
         """
-        edgeList = [x if (x[0] < x[1]) else tuple(reversed(x)) for x in edgeList]  # impone v1 <= v2
-        # e se v1 == v2 ?
-        #if (any([x[0] == x[1] for x in edgeList])):
-            #raise ValueError('La lista contiene un self-loop!')  # eccezione
-
-        edgeList = list(set(edgeList))  # elimina i duplicati
-        
         heatMap = np.zeros(self.NEdges, dtype=int)  # vettore di zeri
-
+        # Duplicates set the same entry to 1 twice, as the original's set did
         for val in edgeList:
-            try:
-                i = self.Edges.index(val)
-            except:
-                print('Wrong Edge!',val)
-                errstr = "L'edge ", val, " non esiste!"
-                raise ValueError(errstr)
-            heatMap[i] = 1
+            heatMap[self.edgeIndex(val)] = 1
         return heatMap
 
     def set_weights_by_coo(self, data, rows, col):
@@ -160,11 +208,6 @@ class SimplexGraph:
                 if (prev != -9999):  # se è connesso e non è source
                     forward[prev].append(foll)
             self.Followers.append(forward)
-        # non c'è nessun bisogno di restituire una matrice densa
-        # if withDistances:
-        #     return (self.pred, self.dist)
-        # else:
-        #     return self.pred
 
     def shortestPathTree(self, source, withD=False, justEdges=False):
         """ Restituisce la matrice dello shortest path tree centrata nel vertice source. Se withD è vero
@@ -184,8 +227,6 @@ class SimplexGraph:
             if self.pred is None:
                 _ = self.computeShortestPath(withD)
 
-        # definiamo una matrice sparsa della giusta dimensione che andrà in output
-        # SPT = scipy.sparse.coo_matrix(self.NVert,self.NVert) # NO, SPRECA SOLO TEMPO!
         # estraiamo dalla matrice dei precedenti la riga che ci serve
         link = np.array(self.pred[source, :])
         # predisponiamo i vettori data, rows e col per creare la matrice del SPT
@@ -284,9 +325,12 @@ class SimplexGraph:
         # contiene ancora entrambe le versioni dell'edge (v1,v2 e v2,v1). Imponiamo solo quella (v1,v2) con v1<v2
         self.Sentinel = [x for x in self.Sentinel if (x[0] < x[1])]
         self.Sentinel = sorted(self.Sentinel, key=lambda x: (x[0], x[1]))
+
+        # We also keep the sentinel edges as a set of int pairs, for the
+        # membership check in closeCycle (a list search before)
+        self.SentinelSet = set((int(x[0]), int(x[1])) for x in self.Sentinel)
         return (ST, self.Sentinel, self.CCV)
 
-    #@njit
     def closeCycle(self, E, force=None):
         """
         Funzione che prende in input un sentinel edge E, e sfruttando la matrice
@@ -294,11 +338,15 @@ class SimplexGraph:
         delle 1-catene che descrive il ciclo identificato da E nello Shortest Path Tree.
         Lo SPT è quello radicato nel nodo ORIGINE DELLA CC DI E!
         Se l'input non è quello atteso, solleva ValueError.
-        SE E NON È UN SENTINEL EDGE NON SO BENE COSA SUCCEDA!
         Se è definito force, forza il nodo sorgente ad essere quello. Utile per
         generare il candidate set.
         Sfrutta la struttura self.closedCycles per verificare se una certa chiusura
         è già stata calcolata
+
+        Fast version: we collect the indices of the edges of the cycle (E,
+        then the two tree paths back to the source) and build the 0-1 vector
+        once, taking each count mod 2 so that edges shared by the two paths
+        cancel, as the original sum of heat maps did.
         """
 
         if (force is not None):  # se è fissata l'origine
@@ -310,15 +358,18 @@ class SimplexGraph:
                 pass
 
         try:
-            # trova l'heatmap del sentinel edge. Gestisce l'errore se E non è giusto
-            cycle = self.getHeatMap([E])
-        except Exception :
+            # index of the closing edge E; raises if E does not exist
+            edgeIdx = [self.edgeIndex(E)]
+        except Exception:
             raise Exception
-        # ora cycle contiene l'heatmap del solo sentinel edge.
-        # Proviamo a fare un controllino che sia un sentinel edge. Se self.Sentinel non esiste può comunque far danni
-        if (self.Sentinel is not None and force is None):  # solo se non è definito force
-                                                        # (in quel caso ci sta che non siano sentinel edges)
-            if (E not in self.Sentinel and tuple(reversed(E)) not in self.Sentinel):
+
+        # controllo che sia un sentinel edge (solo se force non è definito)
+        if (self.SentinelSet is not None and force is None):
+            a = int(E[0])
+            b = int(E[1])
+            if a > b:
+                a, b = b, a
+            if (a, b) not in self.SentinelSet:
                 raise ValueError("E non è un sentinel edge!")
 
         # fissiamo i bordi del sentinel edge
@@ -332,7 +383,6 @@ class SimplexGraph:
                 source = force
         else:
             # troviamo il NODO ORIGINE della CC di E
-            # -1 perchè le CC partono da 1 ma i vettori da 0. Sarebbe uguale usare v2
             source = self.Origins[self.CCV[v1] - 1]
             key = (source, E[0], E[1])  # calcoliamo la chiave del ciclo da chiudere
         # Calcoliamo i pred, se non è già stato fatto
@@ -346,11 +396,9 @@ class SimplexGraph:
                 'Critical Error! Source e v2 dovrebbero essere per costruzione nella stessa CC')
         follow = v2
         while (pr != -9999):  # segue all'indietro i precedenti verso source (che ha link -9999)
-            cycle += self.getHeatMap([(pr, follow)])
+            edgeIdx.append(self.edgeIndex((pr, follow)))
             follow = pr
             pr = link[pr]
-
-        # Ora stessa cosa per v1, ma gli edge in comune fra i due path vanno eliminati => SOMMA % 2
 
         pr = link[v1]
         if (pr == -9999 and source != v1):  # significa che v1 è irraggiungibile da source, sono in due componenti connesse diverse
@@ -358,14 +406,14 @@ class SimplexGraph:
                 'Critical Error! Source e v1 dovrebbero essere per costruzione nella stessa CC')
         follow = v1
         while (pr != -9999):  # finchè non torno a source
-            cycle += self.getHeatMap([(pr, follow)])
+            edgeIdx.append(self.edgeIndex((pr, follow)))
             follow = pr
             pr = link[pr]
-        # ora alcuni cicli saranno stati contati 2 volte. Quelli in comune vanno eliminati!
-        cycle = cycle % 2
 
-        # ora cycle contiene la descrizione vettoriale del ciclo identificato dal
-        # sentinel edge E, rispetto all'ordinamento self.Edges
+        # Count how many times each edge appears, then keep it iff odd
+        cycle = np.zeros(self.NEdges, dtype=int)
+        np.add.at(cycle, edgeIdx, 1)
+        cycle = cycle % 2
 
         # aggiorniamo il dizionario dei cicli chiusi
         self.closedCycles[key] = cycle
@@ -382,7 +430,6 @@ class SimplexGraph:
         for e in self.Sentinel:
             self.cycleBasis.append(self.closeCycle(e))
 
-    #@njit
     def getAnnotation(self, d2):
         """
         d2: border matrix of the set of faces of the simplicial complex, borders are written as rows.
@@ -399,14 +446,14 @@ class SimplexGraph:
             """
             cdef int i, l = -1
             cdef int N = len(col)
-            
+
             cdef long[:] column = col
-            
+
             for i in range(N):
                 if column[i] > 0:
                     l = i
             return l
-        
+
 
         lowSet = {}  # dictionary with low indexes and relative rows
 
@@ -426,7 +473,7 @@ class SimplexGraph:
                 else:
                     d2 = np.delete(d2, (i), axis=0)
             dimB1 = i  # dimensione dello spazio dei bordi
-            
+
 
         if (dimB1 != 0):
             Z = np.concatenate((d2, Z), axis=0)
@@ -464,72 +511,148 @@ class SimplexGraph:
         self.dimH1 = np.shape(A)[1]
         self.Ann = np.matrix(A).transpose()
 
-        # OTTIMIZZAZIONE!
-        # Qui verrebbe bene creare un dizionario di coppie edge-annotazione
-        # per velocizzare la ricerca negli step successivi. Edge nel formato
-        # (v1, v2), con v1<v2
         self.AnnDict = {}
         for i, e in enumerate(self.Sentinel):
             ann = self.Ann[:, i]
             self.AnnDict[e] = ann
 
-        # # MULTIPROCESSING! If pipe exists send message
-        # if self.pipe is not None:
-        #     self.pipe.send([self.eps, mlt.current_process().pid, 0, self.dimH1, self.NonZ])
+        # Fast version: the same annotations as a plain (dimH1 x #sentinel)
+        # int array, with the column of each sentinel edge in SentinelIdx.
+        # Column j of AnnMat is the annotation of self.Sentinel[j].
+        self.AnnMat = np.asarray(self.Ann, dtype=np.int64)
+        self.SentinelIdx = {}
+        for j, e in enumerate(self.Sentinel):
+            self.SentinelIdx[(int(e[0]), int(e[1]))] = j
 
         return (self.Ann, self.dimB1, self.dimZ1, self.dimH1)
 
-    
+
     def innerProd(self, S, C):
         """ Scalar Product over Z2 of support vector S and the ANNOTATION of cycle C
         """
-        #if (len(S) != len(C)):
-            #raise ValueError("Dimensioni non compatibili!")
-
         return np.mod(np.dot(np.array(S).transpose(), np.array(C)), 2)
-    
-    #it seems like the advantage of the numba version of the inner product is lost in making the int arrays
+
+    def sentinelBits(self, Sup):
+        """ Z2 label of every sentinel edge with respect to support vector Sup.
+
+            Entry j is <Sup, annotation of self.Sentinel[j]> mod 2, i.e. the
+            value innerProd(Sup, AnnDict[Sentinel[j]]) computed for all j at
+            once. Returns a 1-D int array of length #sentinel edges.
+        """
+        sup = np.asarray(Sup, dtype=np.int64).ravel()
+        bits = sup.dot(self.AnnMat) % 2
+        return np.asarray(bits, dtype=np.int64).ravel()
+
     def computeLabels(self, Sup):
         """ Calcola i labels rispetto al support vector S_i Sup
-        """
-        #if (self.Ann is None):
-            #raise ValueError("Non è stata calcolata l'annotazione degli edges!")
-        for p in range(self.NVert):  # per ogni root
-            #link = self.pred[p,:]
-            forward = self.Followers[p]
-            """ Utilizziamo un metodo tipo push pop: ad ogni nodo aggiungiamo la
-            lista dei successori in coda, poi pop di uno e avanti così """
-            self.Labels[p, p] = 0  # il label di source è 0
-            driver = []  # lista di push/pop DI TUPLE (PREVIOUS,FOLLOWER)
-            # iniziamo dai sucessori di source
-            add = [(p, x) for x in forward[p]]
-            driver.extend(add)
-            while (len(driver) != 0):  # finchè non ho esaurito i successori
-                (prev, foll) = driver.pop(0)  # pop del primo elemento (BREADTH FIRST!)
-                lab = self.Labels[p, prev]  # leggiamo il label del nodo precedente
-                edge = (prev, foll) if prev < foll else (foll, prev)  # scriviamo l'edge
-                try:  # leggiamo l'annotazione dell'ege
-                    ann = np.array(self.AnnDict[edge],dtype=float)
-                except KeyError:
-                    self.Labels[p, foll] = lab  # non è un sentinel e quindi non cambia
-                else:
-                    # calcola il prodotto scalare in Z2 e somma
-                    self.Labels[p, foll] = (lab + self.innerProd(Sup, ann)) % 2
-                # Ora aggiungiamo alla lista driver i successori di foll e avanti
-                add = [(foll, x) for x in forward[foll]]
-                driver.extend(add)
 
-        # return self.Labels # inutile restituire una struttura pesante
+            Fast version. For every root p we walk its shortest path tree
+            breadth first; the label of a node is the label of its parent
+            plus the bit of the edge between them (0 for non-sentinel
+            edges), mod 2. Same values as the original.
+        """
+        bits = self.sentinelBits(Sup)
+        sentIdx = self.SentinelIdx
+
+        for p in range(self.NVert):  # per ogni root
+            forward = self.Followers[p]
+            # We work on the row as a Python list (fast item access) and
+            # write it back at the end. Entries never visited keep their
+            # previous value, as in the original.
+            row = self.Labels[p, :].tolist()
+            row[p] = 0  # il label di source è 0
+
+            driver = deque()
+            for x in forward[p]:
+                driver.append((p, x))
+            while driver:  # finchè non ho esaurito i successori
+                (prev, foll) = driver.popleft()  # BREADTH FIRST
+                lab = row[prev]
+                if prev < foll:
+                    edgeKey = (int(prev), int(foll))
+                else:
+                    edgeKey = (int(foll), int(prev))
+                j = sentIdx.get(edgeKey)
+                if j is None:
+                    row[foll] = lab  # non è un sentinel e quindi non cambia
+                else:
+                    row[foll] = (lab + int(bits[j])) % 2
+                for x in forward[foll]:
+                    driver.append((foll, x))
+
+            self.Labels[p, :] = row
+
+    def nonTreeEdges(self, p):
+        """ Non-tree edges of the shortest path tree rooted at p, as a list
+            of (v1, v2) with v1 < v2, IN THE SAME ORDER as
+            shortestPathTree(p, justEdges=True).
+
+            The original rebuilds, for every root, the set of all edges of
+            the root's connected component and iterates over
+            (that set) - (tree edges). Here we build the component edge set
+            once per component, from the identical sequence of edges, and
+            reuse it. A set built by the same insertions in the same order
+            has the same internal layout, and the difference has the same
+            sizes on both sides, so iterating it gives the same order.
+        """
+        if self.CCV is None:
+            # Components unknown: fall back to the original method
+            return self.shortestPathTree(p, justEdges=True)
+
+        if self._edgeW is None:
+            rw, cl, _ = scipy.sparse.find(self.Weights)
+            self._edgeW = list(zip(list(rw), list(cl)))
+            self._compEdgeSet = {}
+
+        # Edge set of p's component, built from the same filtered sequence
+        # the original uses (edges whose first vertex is reachable from p)
+        comp = self.CCV[p]
+        if comp not in self._compEdgeSet:
+            link = np.array(self.pred[p, :])
+            link[p] = p
+            filtered = [x for x in self._edgeW if link[x[0]] != -9999]
+            self._compEdgeSet[comp] = set(filtered)
+        edgeSet = self._compEdgeSet[comp]
+
+        # Tree edges of the shortest path tree of p, in both orientations:
+        # every reachable vertex other than p is joined to its predecessor
+        link = self.pred[p, :]
+        nodes = np.nonzero(link != -9999)[0]
+        prevs = link[nodes]
+        treeEdges = set(zip(prevs.tolist(), nodes.tolist()))
+        treeEdges.update(zip(nodes.tolist(), prevs.tolist()))
+
+        NTE = list(edgeSet - treeEdges)
+        NTE = [x for x in NTE if (x[0] < x[1])]
+        return NTE
 
     def fixNTE(self):
         """ Calcola un array di NTE per ogni sorgente p, e la salva in self.NTE
+            Fast version: same lists, same order, via nonTreeEdges.
         """
         self.NTE = []
         for p in range(self.NVert):
-            nte = self.shortestPathTree(p, justEdges=True)
+            nte = self.nonTreeEdges(p)
             for e in nte:
                 self.NTE.append((p, e))
-        # ora tutti i NTE sono calcolati una volta per tutte
+
+    def buildCandidateArrays(self):
+        """ Store the (root, non-tree edge) candidates as parallel arrays, in
+            the order of self.NTE: root, the two endpoints, and the column of
+            the edge in AnnMat (-1 if the edge is not a sentinel edge).
+        """
+        nCand = len(self.NTE)
+        self.NTE_root = np.empty(nCand, dtype=np.int64)
+        self.NTE_u = np.empty(nCand, dtype=np.int64)
+        self.NTE_v = np.empty(nCand, dtype=np.int64)
+        self.NTE_sent = np.empty(nCand, dtype=np.int64)
+        for k, (p, e) in enumerate(self.NTE):
+            u = int(e[0])
+            v = int(e[1])
+            self.NTE_root[k] = p
+            self.NTE_u[k] = u
+            self.NTE_v[k] = v
+            self.NTE_sent[k] = self.SentinelIdx.get((u, v), -1)
 
     def resetLabels(self):
         """ Resetta i labels per poterli calcolare rispetto al nuovo vettore di supporto
@@ -551,49 +674,42 @@ class SimplexGraph:
                 pass  # se non è un sentinel fai nulla
 
         return ann
-    
+
 
     def findShortestNonOrtho(self, i):
         """ Funzione che genera una lista di cicli non-ortogonali (m = 1) a Sup
             che è l' i-esimo vettore di supporto.
             I NTE seguono la convenzione lessicografica
             If allDraws ritorna una lista di tutti i cicli minimi a parità!
+
+            Fast version: the orthogonality test is evaluated for all
+            candidates at once. A candidate (root s, non-tree edge (u, v))
+            is non-orthogonal to Sup iff
+                Labels[s, u] + Labels[s, v] + bit(u, v) = 1  (mod 2),
+            with bit(u, v) the sentinel bit of the edge (0 if not sentinel).
+            The selected candidates keep the order of self.NTE, so ties are
+            resolved exactly as before.
         """
-        # bisogna controllare che sia stato generato tutto il resto
-        # calcolare i labels
-        # self.resetLabels() # riporta i labels a -1 Con i followers non serve più
-
         Sup = self.S[:, i-1]
-        _ = self.computeLabels(Sup)  # è da fare lo stesso
-        
-        ## SORRY: THE NUMBA VERSION IS USELESS
-        ## IT TAKES MORE TO CAST TO FLOAT THAN WHAT IT SAVES BY COMPILING THE SCALAR PRODUCT
-        def checkOrt(s, e):
-            """ In input una sorgente dello SPT e un edge scritto giusto
-            """
-            try:
-                ann = self.AnnDict[e]  # trova l'annotazione dal dizionario
-                # test numba
-                #ann = np.array(ann, dtype=float)
-            except KeyError:  # se non appartiene ai sentinel vale 0
-                lab = 0
-            else:
-                #SupF = np.array(Sup, dtype=float)
-                lab = self.innerProd(Sup, ann)  # calcola il prodotto
+        _ = self.computeLabels(Sup)
 
-            return (self.Labels[s, e[0]] + self.Labels[s, e[1]] + lab) % 2
-            # return (self.L[e[0]] + self.L[s,e[1]] + lab ) %2
+        # Sentinel bits, with an extra 0 at the end for index -1
+        bits = self.sentinelBits(Sup)
+        bitsExt = np.append(bits, 0)
+        edgeBit = bitsExt[self.NTE_sent]
 
-        candidates = []  # lista di tuple (origine, NTE)
-
-        # selezioniamo solo quelli non ortogonali
-        candidates = [x for x in self.NTE if checkOrt(x[0], x[1]) == 1]
+        labelU = self.Labels[self.NTE_root, self.NTE_u]
+        labelV = self.Labels[self.NTE_root, self.NTE_v]
+        orthoTest = (labelU + labelV + edgeBit) % 2
+        selected = np.nonzero(orthoTest == 1)[0]
 
         # generiamo i vettori dei cicli a partire da (source, non-tree edge)
-        candidates = [self.closeCycle(x[1], force=x[0]) for x in candidates]
+        candidates = []
+        for k in selected:
+            source = int(self.NTE_root[k])
+            edge = self.NTE[k][1]
+            candidates.append(self.closeCycle(edge, force=source))
 
-        # definiamo un metodo per calcolare la lunghezza di un ciclo
-        #@njit # won't work
         def lenCycle(C):
             """ Calcola la lunghezza di un ciclo come prodotto scalare tra il
                 vettore dei pesi self.WEdges e la descrizione del ciclo nella
@@ -634,8 +750,6 @@ class SimplexGraph:
                     if counter == len(minList2):
                         minList2.append(c[0])
 
-            # res = [ c[0] for c in minList] # only want the edges, not lengths
-            # res = [ np.array( c , dtype=int ) for c in res ] # make it a np.array
             res = [np.array(c, dtype=int) for c in minList2]
             return res
 
@@ -653,17 +767,11 @@ class SimplexGraph:
             Deve calcolare l'annotazione del ciclo.
             index deve andare da 0 a g-1
         """
-
-        # self.SHB.append( newC ) # aggiungi il nuovo ciclo # QUESTO CAMBIA PER LA
-        # VERSIONE RICORSIVA
         sup_i = self.Support[index]  # support vector del nuovo ciclo
-        # NUMBA MAKE FLOAT
         AnnNewC = self.cycleAnnotation(newC)  # annotazione del nuovo ciclo
 
         for j in range(index+1, self.dimH1):  # per S_j da i+1 a g
             sup_j = self.Support[j]
-            # NUMBA MAKE FLOAT
-            #Sup_j = np.array(self.Support[j], dtype=float)
             self.Support[j] = (sup_j + sup_i * self.innerProd(AnnNewC, sup_j)) % 2  # somma ( =sottrae) la proiezione
 
     def initSup(self, Draws=True):
@@ -681,68 +789,41 @@ class SimplexGraph:
         self.C = np.zeros((len(self.Sentinel), self.dimH1), dtype=np.int64)
         self.B = np.zeros((self.dimH1, self.dimH1), dtype=np.int64)
 
-        # compute labels as a starter
+        # compute labels as a starter: row i of L holds the sentinel bits of
+        # support vector S[:, i] (same values as the original double loop)
         for i in range(self.dimH1):
-            for j in range(len(self.Sentinel)):
-                ann = self.AnnDict[self.Sentinel[j]]
-                self.L[i, j] = self.innerProd(self.S[:, i], ann)
+            self.L[i, :] = self.sentinelBits(self.S[:, i])
 
         # fix non-tree edges as we need them for the base case
         _ = self.fixNTE()
+        self.buildCandidateArrays()
 
         # FIND A FILTER BETWEEN EDGES AND SENTINEL EDGES
-        Filter = np.array([1 if (x in self.Sentinel) else 0 for x in self.Edges])
+        Filter = np.array([1 if ((int(x[0]), int(x[1])) in self.SentinelSet) else 0 for x in self.Edges])
         self.SentFilter = np.nonzero(Filter)
-
-        # Let us initialize the variable self.SHB as a class Basis object of the
-        # Geometry module
 
         self.SHB = GeometryN.Basis(self.NEdges, edgelist=self.Edges)
 
         self.allDraws = Draws
 
-    # def  Update(self,i,k):
-    #     """ Recursive version of the UpdateSup function.
-    #         FOR NOW: It works nothing like the paper. It simply pops the last
-    #         basis vector that was added to SHB, finds the corresponding Support
-    #         vector, and updates the old way via Grahm-Schmidt
-    #     """
-    #     newCycle = self.SHB[-1] # è una tupla con anche la lunghezza!
-    #     newCycle = newCycle[0] # ora è solo l'array
-    #     ind = len(self.SHB)-1
-    #     self.updateSup(newCycle,ind)
-
-    #@njit #won't
     def mulz2(self, a, b):
         return np.mod(np.matmul(a, b), 2).astype(np.float64)
 
-    #@njit #won't
     def sumz2(self, a, b):
         return np.mod(a+b, 2).astype(np.float64)
 
-    #@njit #won't
     def inv_z2(self, a):
         # Input/Output are numpy arrays
-        # print(a)
         det = np.linalg.det(a)
 
         return np.mod(np.round(np.linalg.inv(a)*det), 2).astype(np.int64)
-        #return np.array(Matrix(a).inv_mod(2)).astype(np.int64)
 
-    #@njit #won't
     def UpdateMehlhorn(self, i, k):
         """ Update function optimized for the divide et impera recursive approach
             as per Mehlhorn (2004), Dey (2018).
             Uses instance variables L,C,B and S. Receives recursion parameters
             i and k.
-            Improves (?) from O(m^3) to O(gn^2) for low-connected graphs and to
-            O(gn^2 log n) for highly-connected ones.
         """
-        # # MULTIPROCESSING!
-        # if self.pipe is not None:
-        #     self.pipe.send([self.eps, mlt.current_process().pid,
-        #                     self.SHB.Card, self.dimH1, self.NonZ])
-        # define short for recursion indices
         lam = i + floor(k/2)-1
         mu = i+k-1
 
@@ -752,11 +833,6 @@ class SimplexGraph:
 
         # By definition of A
         A = self.mulz2(Y, self.inv_z2(X))
-
-        # # MULTIPROCESSING!
-        # if self.pipe is not None:
-        #     self.pipe.send([self.eps, mlt.current_process().pid,
-        #                     self.SHB.Card, self.dimH1, self.NonZ])
 
         # Update Support vectors
         S1 = np.zeros((self.dimH1, mu - lam + 1), dtype=int)
@@ -772,14 +848,7 @@ class SimplexGraph:
         m, _ = A.shape
         W = np.concatenate((A, np.eye(m)), axis=1)
 
-        # # MULTIPROCESSING!
-        # if self.pipe is not None:
-        #     self.pipe.send([self.eps, mlt.current_process().pid,
-        #                     self.SHB.Card, self.dimH1, self.NonZ])
-
         Z = self.L[i-1:mu, :]
-        # New labels are
-        #L1 = np.zeros( ( mu - lam + 1 , len(self.Sentinel) ) , dtype=int )
 
         L1 = self.mulz2(W, Z)
         self.L[lam+1-1:mu, :] = L1
@@ -788,11 +857,6 @@ class SimplexGraph:
         # potentially C has changed too
 
         self.B = self.mulz2(self.L, self.C)
-
-        # # MULTIPROCESSING!
-        # if self.pipe is not None:
-        #     self.pipe.send([self.eps, mlt.current_process().pid,
-        #                     self.SHB.Card, self.dimH1, self.NonZ])
 
     def projOnSent(self, C):
         """
@@ -806,19 +870,15 @@ class SimplexGraph:
             C = C[0]
 
         C = np.array(C, dtype=int)
-        # print(C.shape)
         return C[self.SentFilter]
 
     def ExtendBasis(self, i, k):
         """ Recursive procedure to compute the minimal homology basis. Follows
             Mehlhorn(2004) and Dey (2018).
-            Will require using the matrices to compute labels, to update sup andrà
-            all.
         """
         if k == 0:  # If homology is trivial it returns the empty basis
             return
         if k == 1:  # BASE CASE. Will search for the shortest non-orthogonal cycle
-            #print("Base case, i = ",i)
             newCycle = self.findShortestNonOrtho(i)
 
             # save the new cycle to the SHB
