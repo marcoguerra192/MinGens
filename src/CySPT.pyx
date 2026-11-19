@@ -21,9 +21,27 @@
 #      order as before, so the chosen cycle is the same.
 # fixNTE is deliberately unchanged: it fixes the order of the candidates,
 # and that order decides ties between equally short cycles.
+#
+# fast-v3 (2026-11). One correctness fix and further speed-ups, same
+# outputs otherwise (see CHANGES.md):
+#   6. inv_z2 inverts over Z2 exactly, by Gauss-Jordan elimination. The
+#      previous version used A^-1 * det(A) from floating point, which loses
+#      the integers once det(A) passes 2^53: wrong inverses from ~50 x 50,
+#      i.e. H1 of dimension ~100 at one scale.
+#   7. UpdateMehlhorn recomputes only the rows of B = L C that change.
+#   8. mulz2 multiplies in float64 (BLAS); the entries are small integers,
+#      exact in float64.
+#   9. getAnnotation reduces rows stored as bit vectors (Python ints). It
+#      accepts the dense d2 as before, or the rows as bit vectors directly.
+#  10. Candidate cycle lengths come from tree distances, computed once per
+#      graph (d(r,u) + d(r,v) + l(uv) - 2 d(r, lca(u,v))); a cycle vector is
+#      built only for the shortest candidates.
+#  11. computeLabels fills all trees at once, level by level;
+#      cycleAnnotation is vectorised; with draws, identical tied cycles
+#      (the same cycle reached from different roots) are compared once.
+# The sympy import is removed: it was no longer used.
 
 import numpy as np
-from sympy import Matrix
 from math import floor, ceil
 import scipy.sparse
 from scipy.sparse import csgraph
@@ -36,7 +54,47 @@ import os
 
 # Marker to check which implementation is loaded (the compiled module is
 # used in preference to the .pyx, so a rebuild is needed after editing)
-CYSPT_IMPLEMENTATION = 'fast-v2'
+CYSPT_IMPLEMENTATION = 'fast-v3'
+
+
+
+def gf2_inverse(matrix):
+    """ Inverse of a square matrix over Z2, by Gauss-Jordan elimination.
+
+        Exact at any size: rows are 0/1 and adding rows is XOR, so nothing
+        grows and nothing is rounded. Raises np.linalg.LinAlgError if the
+        matrix is singular over Z2. Returns an int64 array.
+    """
+    n = matrix.shape[0]
+    augmented = np.zeros((n, 2 * n), dtype=np.uint8)
+    augmented[:, :n] = np.asarray(matrix, dtype=np.int64) % 2
+    augmented[:, n:] = np.eye(n, dtype=np.uint8)
+    for column in range(n):
+        candidates = np.nonzero(augmented[column:, column])[0]
+        if candidates.size == 0:
+            raise np.linalg.LinAlgError("matrix is singular over Z2")
+        pivot = column + candidates[0]
+        if pivot != column:
+            augmented[[column, pivot]] = augmented[[pivot, column]]
+        rows_to_clear = np.nonzero(augmented[:, column])[0]
+        rows_to_clear = rows_to_clear[rows_to_clear != column]
+        augmented[rows_to_clear] ^= augmented[column]
+    return augmented[:, n:].astype(np.int64)
+
+
+def rows_to_bits(rows):
+    """ Rows of a 0/1 matrix as Python ints, bit k of row r = rows[r, k].
+
+        If `rows` is already a sequence of Python ints (bit vectors), it is
+        returned as a list unchanged.
+    """
+    if len(rows) == 0:
+        return []
+    if isinstance(rows[0], (int, np.integer)):
+        return [int(r) for r in rows]
+    dense = np.asarray(rows, dtype=np.uint8)
+    packed = np.packbits(dense, axis=1, bitorder='little')
+    return [int.from_bytes(r.tobytes(), 'little') for r in packed]
 
 
 class SimplexGraph:
@@ -433,76 +491,60 @@ class SimplexGraph:
     def getAnnotation(self, d2):
         """
         d2: border matrix of the set of faces of the simplicial complex, borders are written as rows.
+            Either a 0/1 matrix (one row per triangle, one column per edge
+            of self.Edges), or a list of the rows as bit vectors (Python
+            ints, bit k = edge k), which avoids the dense matrix.
         Z: basis of 1-dim-cycles. Each row is a cycle obtained from a spanning tree and a sentinel edge.
         returns an annotation of sentinel edges. Non sentinel edges have annotation equal to 0.
+
+        fast-v3: same reduction, in the same order, so the same annotation:
+        boundary rows first, then the fundamental cycles, each reduced by
+        the rows whose lowest entry (largest edge index) it shares. Rows are
+        bit vectors and XOR adds them over Z2, instead of dense rows with a
+        deletion per zero row.
         """
-        Z = self.cycleBasis
+        # pivots maps a lowest edge index to the reduced row that has it,
+        # and, for reduced cycle rows, to the index of that cycle.
+        pivots = {}
 
-        def low(col):
-            """
-        col: 1-dimensional array.
-            gets the index of the "lowest" element in col different from 0.
-            if col=0 then low = -1
-            """
-            cdef int i, l = -1
-            cdef int N = len(col)
+        # The boundaries. A row that reduces to zero is dependent and dropped.
+        dimB1 = 0
+        for row in rows_to_bits(d2):
+            low = row.bit_length() - 1
+            while row and low in pivots:
+                row ^= pivots[low][0]
+                low = row.bit_length() - 1
+            if row:
+                pivots[low] = (row, None)
+                dimB1 += 1
 
-            cdef long[:] column = col
+        # The fundamental cycles. For each we record which earlier reduced
+        # cycle rows were added to it (boundaries are zero in H1).
+        cycleRows = rows_to_bits(np.asarray(self.cycleBasis, dtype=np.uint8)) if len(self.cycleBasis) else []
+        used = []
+        pivotCycles = []
+        for index, row in enumerate(cycleRows):
+            combo = 0
+            low = row.bit_length() - 1
+            while row and low in pivots:
+                pivotRow, pivotCycle = pivots[low]
+                row ^= pivotRow
+                if pivotCycle is not None:
+                    combo ^= 1 << pivotCycle
+                low = row.bit_length() - 1
+            if row:
+                # an independent class: the cycle is a basis element of H1
+                pivots[low] = (row, index)
+                pivotCycles.append(index)
+                combo ^= 1 << index
+            used.append(combo)
 
-            for i in range(N):
-                if column[i] > 0:
-                    l = i
-            return l
+        # A[c, j]: coordinate of fundamental cycle c on the j-th independent cycle
+        A = np.zeros((len(cycleRows), len(pivotCycles)), dtype=np.int64)
+        for j, p in enumerate(pivotCycles):
+            for c, combo in enumerate(used):
+                A[c, j] = (combo >> p) & 1
 
-
-        lowSet = {}  # dictionary with low indexes and relative rows
-
-        if len(d2) == 0:  # controlla se d2 è vuoto!
-            dimB1 = 0
-            i = 0
-        else:
-            i = 0
-            while i != len(d2):
-                lowRowi = low(d2[i])
-                while lowRowi in lowSet.keys():
-                    d2[i] = (d2[i]+d2[lowSet[lowRowi]]) % 2
-                    lowRowi = low(d2[i])
-                if lowRowi > -1:
-                    lowSet[lowRowi] = i
-                    i = i+1
-                else:
-                    d2 = np.delete(d2, (i), axis=0)
-            dimB1 = i  # dimensione dello spazio dei bordi
-
-
-        if (dimB1 != 0):
-            Z = np.concatenate((d2, Z), axis=0)
-        else:
-            pass  # lasciamo Z
-        # we start the reduction from row dimB1
-        totRow = len(Z)
-        reductionMatrix = np.identity(totRow, dtype=int)
-        Id = np.identity(totRow, dtype=int)
-        elementsToDelete = []
-
-        while i != totRow:
-            lowRowi = low(Z[i])
-            while lowRowi in lowSet.keys():
-                Z[i] = (Z[i]+Z[lowSet[lowRowi]]) % 2
-                reductionMatrix[i] = (reductionMatrix[i]+Id[lowSet[lowRowi]]) % 2
-                lowRowi = low(Z[i])
-
-            if lowRowi > -1:
-                lowSet[lowRowi] = i
-                i = i+1
-            else:
-                elementsToDelete.append(i)
-                i = i+1
-
-        # eliminate coordinates of cycles that are borders:
-        reductionMatrix = np.delete(reductionMatrix, elementsToDelete, axis=1)
-        reductionMatrix = np.delete(reductionMatrix, range(dimB1), axis=1)
-        A = np.delete(reductionMatrix, range(dimB1), axis=0)
         """observation: the number of rows of A is the dimension of the 1-dim-cycle group;
            the number of columns is the dimension of the 1st homology group
         """
@@ -523,6 +565,10 @@ class SimplexGraph:
         self.SentinelIdx = {}
         for j, e in enumerate(self.Sentinel):
             self.SentinelIdx[(int(e[0]), int(e[1]))] = j
+
+        # Column of each edge of self.Edges in AnnMat (-1: not a sentinel)
+        self.edgeSentinelColumn = np.array(
+            [self.SentinelIdx.get((int(a), int(b)), -1) for a, b in self.Edges], dtype=np.int64)
 
         return (self.Ann, self.dimB1, self.dimZ1, self.dimH1)
 
@@ -546,41 +592,103 @@ class SimplexGraph:
     def computeLabels(self, Sup):
         """ Calcola i labels rispetto al support vector S_i Sup
 
-            Fast version. For every root p we walk its shortest path tree
-            breadth first; the label of a node is the label of its parent
-            plus the bit of the edge between them (0 for non-sentinel
-            edges), mod 2. Same values as the original.
+            fast-v3: the label of a node is the label of its parent plus the
+            bit of the edge between them (0 for non-sentinel edges), mod 2;
+            the root has label 0. All trees are filled at once, level by
+            level. Same values as before; entries never visited keep their
+            previous value.
         """
+        if getattr(self, 'treeLevels', None) is None:
+            self._prepareTrees()
         bits = self.sentinelBits(Sup)
-        sentIdx = self.SentinelIdx
+        bitsExt = np.append(bits, 0)
+        n = self.NVert
+        self.Labels[np.arange(n), np.arange(n)] = 0
+        for rows, nodes, parents, columns in self.treeLevels:
+            self.Labels[rows, nodes] = (self.Labels[rows, parents] + bitsExt[columns]) % 2
 
-        for p in range(self.NVert):  # per ogni root
-            forward = self.Followers[p]
-            # We work on the row as a Python list (fast item access) and
-            # write it back at the end. Entries never visited keep their
-            # previous value, as in the original.
-            row = self.Labels[p, :].tolist()
-            row[p] = 0  # il label di source è 0
+    def _prepareTrees(self):
+        """ Depths, levels and ancestor tables of all shortest path trees
+            (row r of each (n, n) array refers to the tree rooted at r).
+            Used by computeLabels and by the candidate lengths.
+        """
+        n = self.NVert
+        parent = np.asarray(self.pred, dtype=np.int64)
+        reachable = parent >= 0
+        rows, nodes = np.nonzero(reachable)
 
-            driver = deque()
-            for x in forward[p]:
-                driver.append((p, x))
-            while driver:  # finchè non ho esaurito i successori
-                (prev, foll) = driver.popleft()  # BREADTH FIRST
-                lab = row[prev]
-                if prev < foll:
-                    edgeKey = (int(prev), int(foll))
-                else:
-                    edgeKey = (int(foll), int(prev))
-                j = sentIdx.get(edgeKey)
-                if j is None:
-                    row[foll] = lab  # non è un sentinel e quindi non cambia
-                else:
-                    row[foll] = (lab + int(bits[j])) % 2
-                for x in forward[foll]:
-                    driver.append((foll, x))
+        # depth of each node in each tree, level by level from the roots
+        depth = np.full((n, n), -1, dtype=np.int64)
+        depth[np.arange(n), np.arange(n)] = 0
+        levels = []
+        level = 0
+        while True:
+            parentDepth = depth[rows, parent[rows, nodes]]
+            atLevel = (parentDepth == level) & (depth[rows, nodes] < 0)
+            if not np.any(atLevel):
+                break
+            levelRows = rows[atLevel]
+            levelNodes = nodes[atLevel]
+            depth[levelRows, levelNodes] = level + 1
+            levels.append((levelRows, levelNodes, parent[levelRows, levelNodes]))
+            level += 1
 
-            self.Labels[p, :] = row
+        # column in AnnMat of each sentinel edge, as a symmetric matrix
+        sentinelColumn = np.full((n, n), -1, dtype=np.int64)
+        for (a, b), column in self.SentinelIdx.items():
+            sentinelColumn[a, b] = column
+            sentinelColumn[b, a] = column
+        self.treeLevels = [(r, x, p, sentinelColumn[p, x]) for r, x, p in levels]
+
+        # ancestors[j][r, x]: ancestor of x 2^j levels up in tree r
+        # (the root, and nodes outside its component, are their own parent)
+        first = np.where(reachable, parent, np.arange(n)[np.newaxis, :])
+        ancestors = [first]
+        for _ in range(max(1, int(np.ceil(np.log2(max(level, 1)))) + 1)):
+            previous = ancestors[-1]
+            ancestors.append(np.take_along_axis(previous, previous, axis=1))
+        self.treeDepth = depth
+        self.treeAncestors = ancestors
+
+    def _lowestCommonAncestor(self, roots, u, v):
+        """ Lowest common ancestor of u and v in the tree rooted at each root. """
+        a = u.copy()
+        b = v.copy()
+        depthA = self.treeDepth[roots, a]
+        depthB = self.treeDepth[roots, b]
+        swap = depthA < depthB
+        a[swap], b[swap] = b[swap], a[swap]
+        difference = np.abs(depthA - depthB)
+        for j, table in enumerate(self.treeAncestors):
+            move = ((difference >> j) & 1).astype(bool)
+            a[move] = table[roots[move], a[move]]
+        for table in reversed(self.treeAncestors):
+            differ = table[roots, a] != table[roots, b]
+            a[differ] = table[roots[differ], a[differ]]
+            b[differ] = table[roots[differ], b[differ]]
+        return np.where(a == b, a, self.treeAncestors[0][roots, a])
+
+    def _candidateLengths(self):
+        """ Length of every (root r, non-tree edge uv) candidate cycle.
+
+            The candidate is the tree path r -> u, the edge uv and the tree
+            path v -> r. The two paths share the stretch r -> lca(u, v),
+            which cancels mod 2, so the length is
+            d(r, u) + d(r, v) + l(uv) - 2 d(r, lca(u, v)):
+            the same value as WEdges . (cycle vector).
+        """
+        roots = self.NTE_root
+        if roots.size == 0:
+            return np.zeros(0)
+        u = self.NTE_u
+        v = self.NTE_v
+        lca = self._lowestCommonAncestor(roots, u, v)
+        dist = np.asarray(self.dist)
+        weights = self.Weights
+        if scipy.sparse.issparse(weights):
+            weights = weights.tocsr()
+        edgeLengths = np.asarray(weights[u, v], dtype=np.float64).ravel()
+        return dist[roots, u] + dist[roots, v] + edgeLengths - 2.0 * dist[roots, lca]
 
     def nonTreeEdges(self, p):
         """ Non-tree edges of the shortest path tree rooted at p, as a list
@@ -661,19 +769,13 @@ class SimplexGraph:
 
     def cycleAnnotation(self, C):
         """ Calcola l'annotazione del ciclo C (somma delle ann degli edges)
-        """
-        # seleziona gli edges del ciclo
-        C = map(lambda x: bool(x), C)  # rendilo bool
-        edges = [e for (e, filt) in zip(self.Edges, C) if filt]
-        ann = np.zeros((self.dimH1, 1), dtype=int)
-        for e in edges:
-            try:
-                a = self.AnnDict[e]
-                ann = (ann + a) % 2
-            except KeyError:
-                pass  # se non è un sentinel fai nulla
 
-        return ann
+            fast-v3: vectorised, same values; returns a (dimH1, 1) int array.
+        """
+        onCycle = np.asarray(C).ravel() > 0
+        columns = self.edgeSentinelColumn[onCycle]
+        columns = columns[columns >= 0]
+        return (self.AnnMat[:, columns].sum(axis=1) % 2).reshape(-1, 1)
 
 
     def findShortestNonOrtho(self, i):
@@ -682,13 +784,18 @@ class SimplexGraph:
             I NTE seguono la convenzione lessicografica
             If allDraws ritorna una lista di tutti i cicli minimi a parità!
 
-            Fast version: the orthogonality test is evaluated for all
-            candidates at once. A candidate (root s, non-tree edge (u, v))
-            is non-orthogonal to Sup iff
-                Labels[s, u] + Labels[s, v] + bit(u, v) = 1  (mod 2),
-            with bit(u, v) the sentinel bit of the edge (0 if not sentinel).
-            The selected candidates keep the order of self.NTE, so ties are
+            The orthogonality test is evaluated for all candidates at once.
+            A candidate (root s, non-tree edge (u, v)) is non-orthogonal to
+            Sup iff Labels[s, u] + Labels[s, v] + bit(u, v) = 1 (mod 2), with
+            bit(u, v) the sentinel bit of the edge (0 if not sentinel). The
+            selected candidates keep the order of self.NTE, so ties are
             resolved exactly as before.
+
+            fast-v3: candidate lengths are computed once per graph (initSup),
+            and cycle vectors are built only for the shortest candidates.
+            With draws, identical tied cycles are compared once: a copy of a
+            kept cycle is never kept again, and a copy of a rejected one is
+            rejected for the same reason, so the result is unchanged.
         """
         Sup = self.S[:, i-1]
         _ = self.computeLabels(Sup)
@@ -703,63 +810,44 @@ class SimplexGraph:
         orthoTest = (labelU + labelV + edgeBit) % 2
         selected = np.nonzero(orthoTest == 1)[0]
 
-        # generiamo i vettori dei cicli a partire da (source, non-tree edge)
-        candidates = []
-        for k in selected:
-            source = int(self.NTE_root[k])
-            edge = self.NTE[k][1]
-            candidates.append(self.closeCycle(edge, force=source))
-
-        def lenCycle(C):
-            """ Calcola la lunghezza di un ciclo come prodotto scalare tra il
-                vettore dei pesi self.WEdges e la descrizione del ciclo nella
-                base self.Edges
-            """
-            return np.dot(self.WEdges, C)
-
-        # list of tuples (ciclo, lunghezza)
-        candidates = list(zip(candidates, map(lenCycle, candidates)))
+        if getattr(self, 'candidateLength', None) is None:
+            self.candidateLength = self._candidateLengths()
+        lengths = self.candidateLength[selected]
 
         # MULTIPROCESSING!
         if self.pipe is not None:
             self.pipe.send([self.eps, mlt.current_process().pid, i, self.dimH1, self.NonZ])
 
-        if self.allDraws:  # restituisce tutti i pareggi
-            shortest = candidates[0][1]
-            minList = []
-            for x in candidates:
-                if x[1] < shortest:
-                    minList = [x]
-                    shortest = x[1]
-                elif x[1] == shortest:
-                    minList.append(x)
-                else:
-                    pass
+        # The tree-distance lengths add the same weights as
+        # WEdges . (cycle vector), in another order, so they may differ in
+        # the last bits for non-integer weights. We therefore shortlist the
+        # candidates within a tiny tolerance of the minimum, build their
+        # cycles, and choose among them with the original lengths and the
+        # original rules: candidates outside the shortlist are longer anyway.
+        smallest = lengths.min()
+        tolerance = 1e-9 * max(abs(smallest), np.finfo(np.float64).tiny)
+        shortlist = selected[lengths <= smallest + tolerance]
+        cycles = [self.closeCycle(self.NTE[k][1], force=int(self.NTE_root[k])) for k in shortlist]
+        exactLengths = [np.dot(self.WEdges, c) for c in cycles]
+        shortest = min(exactLengths)
+        tied = [c for c, l in zip(cycles, exactLengths) if l == shortest]
 
-            target_annotation = self.cycleAnnotation(
-                minList[0][0])  # annotation of the chosen cycle
-            minList2 = [minList[0][0]]
-            del minList[0]  # remove the chosen cycle from minList
-            for c in minList:
-                cAnn = self.cycleAnnotation(c[0])
-                if not np.count_nonzero(target_annotation - cAnn):
-                    counter = 0
-                    for minC in minList2:
-                        if np.count_nonzero(c[0] - minC):
-                            counter += 1
-                    if counter == len(minList2):
-                        minList2.append(c[0])
+        if not self.allDraws:  # trovane solo uno: il primo dei più corti
+            return np.array(tied[0], dtype=int)
 
-            res = [np.array(c, dtype=int) for c in minList2]
-            return res
-
-        else:  # trovane solo uno
-            def min_len(x, y): return x if x[1] <= y[1] else y
-            minCycle = functools.reduce(min_len, candidates)
-            minCycle = minCycle[0]  # don't care about lengths, just edges
-            minCycle = np.array(minCycle, dtype=int)
-
-            return minCycle
+        # tutti i pareggi omologhi al primo, distinti
+        first = tied[0]
+        targetAnnotation = self.cycleAnnotation(first)
+        kept = [first]
+        seen = {np.asarray(first).tobytes()}
+        for cycle in tied[1:]:
+            key = np.asarray(cycle).tobytes()
+            if key in seen:
+                continue
+            seen.add(key)
+            if np.array_equal(self.cycleAnnotation(cycle), targetAnnotation):
+                kept.append(cycle)
+        return [np.array(c, dtype=int) for c in kept]
 
     def updateSup(self, newC, index):
         """ Funzione che aggiorna i support vector per ogni nuovo ciclo minimo
@@ -806,17 +894,26 @@ class SimplexGraph:
 
         self.allDraws = Draws
 
+        # fast-v3: tree structures and candidate lengths, once per graph
+        self._prepareTrees()
+        self.candidateLength = self._candidateLengths()
+
     def mulz2(self, a, b):
-        return np.mod(np.matmul(a, b), 2).astype(np.float64)
+        """ Product over Z2. In float64, so that NumPy uses BLAS: the entries
+            are sums of 0/1 products, integers far below 2^53, so exact.
+        """
+        product = np.matmul(np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64))
+        return np.mod(product, 2)
 
     def sumz2(self, a, b):
         return np.mod(a+b, 2).astype(np.float64)
 
     def inv_z2(self, a):
-        # Input/Output are numpy arrays
-        det = np.linalg.det(a)
-
-        return np.mod(np.round(np.linalg.inv(a)*det), 2).astype(np.int64)
+        """ Inverse over Z2, exact (Gauss-Jordan). The previous version,
+            mod(round(inv(a) * det(a)), 2), is exact only while det(a) and
+            the adjugate stay below 2^53: it failed from about 50 x 50.
+        """
+        return gf2_inverse(a)
 
     def UpdateMehlhorn(self, i, k):
         """ Update function optimized for the divide et impera recursive approach
@@ -853,10 +950,10 @@ class SimplexGraph:
         L1 = self.mulz2(W, Z)
         self.L[lam+1-1:mu, :] = L1
 
-        # At last, update matrix B, which has changed since L has changed and
-        # potentially C has changed too
-
-        self.B = self.mulz2(self.L, self.C)
+        # At last, update matrix B = L C. fast-v3: only the rows lam..mu-1 of
+        # L have changed, and C has not changed in this update, so only those
+        # rows of B change; recomputing them keeps B equal to L C exactly.
+        self.B[lam+1-1:mu, :] = self.mulz2(self.L[lam+1-1:mu, :], self.C)
 
     def projOnSent(self, C):
         """
