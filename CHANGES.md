@@ -1,5 +1,14 @@
 # Changes
 
+## 2026-11 — cycle vectors in uint8 (`fast-v4`)
+
+`closeCycle` stores each cycle as a uint8 vector over all edges instead of
+int64. The fundamental cycles and the cache of closed cycles keep one such
+vector per cycle, so on large complexes (thousands of cycles over tens of
+thousands of edges) this took gigabytes; it now takes 8 times less. The
+cycles of the minimal basis are still returned as int, so outputs, and
+their types, are unchanged.
+
 ## 2026-11 — exact Z2 inverse, less memory, faster (`fast-v3`)
 
 One correctness fix; otherwise same algorithm, same outputs.

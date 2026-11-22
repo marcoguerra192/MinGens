@@ -40,6 +40,10 @@
 #      cycleAnnotation is vectorised; with draws, identical tied cycles
 #      (the same cycle reached from different roots) are compared once.
 # The sympy import is removed: it was no longer used.
+#
+# fast-v4 (2026-11). closeCycle stores cycle vectors as uint8 instead of
+# int64: 8 times less memory for the fundamental cycles and the cache of
+# closed cycles. Same outputs; the cycles of the basis are still int.
 
 import numpy as np
 from math import floor, ceil
@@ -54,7 +58,7 @@ import os
 
 # Marker to check which implementation is loaded (the compiled module is
 # used in preference to the .pyx, so a rebuild is needed after editing)
-CYSPT_IMPLEMENTATION = 'fast-v3'
+CYSPT_IMPLEMENTATION = 'fast-v4'
 
 
 
@@ -468,8 +472,13 @@ class SimplexGraph:
             follow = pr
             pr = link[pr]
 
-        # Count how many times each edge appears, then keep it iff odd
-        cycle = np.zeros(self.NEdges, dtype=int)
+        # Count how many times each edge appears, then keep it iff odd.
+        # fast-v4: the 0/1 vector is stored as uint8 (it was int64): the
+        # fundamental cycles and the cache of closed cycles hold one vector
+        # per cycle over all edges, which took gigabytes on large complexes.
+        # An edge appears at most 3 times (closing edge and two tree paths),
+        # so the counts fit. Basis elements are returned as int, as before.
+        cycle = np.zeros(self.NEdges, dtype=np.uint8)
         np.add.at(cycle, edgeIdx, 1)
         cycle = cycle % 2
 
